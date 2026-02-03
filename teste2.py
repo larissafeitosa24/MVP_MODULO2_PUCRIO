@@ -210,165 +210,93 @@ def extract_title_and_cover_fields(cover_text: str) -> Dict[str, Optional[str]]:
     return {"title": title, "report_type": report_type, "company": company, "emission_date": emission_date}
 
 # ----------------------------
-# Seções do corpo (v3 robusta)
+# Seções do corpo (v4: por spans no texto)
 # ----------------------------
 
-def _canon_heading(s: str) -> str:
-    """Normaliza linha para comparação de cabeçalho: sem acentos, minúsculo, compactando espaços."""
-    s = _strip_accents_lower(s)
-    s = s.replace("–", "-")
-    s = re.sub(r"[^\w: ]+", "", s)  # remove pontuação (inclui vírgula, ponto etc.)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+def _spaced_letters_pattern(word: str) -> str:
+    # "OBJETIVO" -> "O\s*B\s*J\s*E\s*T\s*I\s*V\s*O"
+    letters = [re.escape(ch) for ch in word]
+    return r"\s*".join(letters)
 
-def _match_heading(norm_line: str, variant: str) -> bool:
-    v = _canon_heading(variant)
-
-    # match exato (com/sem :)
-    if norm_line == v or norm_line == v + ":":
-        return True
-
-    # aceita versão sem espaços (c r o n o g r a m a)
-    if norm_line.replace(" ", "") in {v.replace(" ", ""), v.replace(" ", "") + ":"}:
-        return True
-
-    # ✅ NOVO: aceita quando o título vem com texto na mesma linha:
-    # "Risco / Continuidade...", "Risco: ...", "Risco - ..."
-    if norm_line.startswith(v + " ") or norm_line.startswith(v + ":") or norm_line.startswith(v + "-"):
-        return True
-
-    # ✅ NOVO: aceita prefixos numéricos tipo "2 risco", "02 risco", "2. risco"
-    # (canon_heading remove pontuação, então "2. Risco" vira "2 risco")
-    if re.match(rf"^\d+\s+{re.escape(v)}(\s|:|$)", norm_line):
-        return True
-
-    return False
-
-# ---- CORREÇÃO: evitar falso positivo (ex.: "riscos," no índice quebrado em linhas)
-def _is_heading_candidate(raw_line: str) -> bool:
-    s = (raw_line or "").strip()
-    if not s:
-        return False
-
-    # se termina como frase, provavelmente não é cabeçalho
-    if s.endswith((",", ";", ".", ")", "…")):
-        return False
-
-    # precisa começar com maiúscula ou estar em caixa alta
-    if not (s[0].isupper() or s.isupper()):
-        return False
-
-    # ✅ NOVO: cabeçalho "puro" costuma ser curto (evita cortar quando aparece "Escopo ..." no meio)
-    # (ex.: "Escopo" / "Alcance" / "Cronograma" / "Risco", etc.)
-    if len(s) > 28:
-        return False
-
-    # ✅ NOVO: se tiver muitos tokens, é frase/parágrafo, não cabeçalho
-    if len(s.split()) > 4:
-        return False
-
-    return True
-
-def _find_heading_indices(text: str, start_variants: List[str], end_variants: List[str]) -> Optional[Tuple[int, int]]:
+def _make_heading_regex(words: List[str]) -> re.Pattern:
     """
-    Retorna (i_start_line, i_end_line_exclusive) usando comparação linha-a-linha
-    com tolerância a cabeçalhos espaçados e ':' opcional.
-
-    CORREÇÃO: só considera linha como cabeçalho se passar em _is_heading_candidate().
+    Cabeçalho no começo da linha, aceitando:
+    - "Objetivo"
+    - "2. Objetivo", "02 – Objetivo", "2 Objetivo"
+    - "O B J E T I V O"
+    - separador opcional: ":" "-" "–" "/"
+    - e permitindo texto na mesma linha (m.end() vai ficar depois do separador)
     """
-    lines = (text or "").split("\n")
-    norms = [_canon_heading(ln) for ln in lines]
+    alts = []
+    for w in words:
+        w_up = _strip_accents_lower(w).upper()
+        alts.append(re.escape(w_up))
+        alts.append(_spaced_letters_pattern(w_up))
 
-    # localizar start
-    start_i = None
-    for i, (raw, n) in enumerate(zip(lines, norms)):
-        if not _is_heading_candidate(raw):
-            continue
-        for sv in start_variants:
-            if _match_heading(n, sv):
-                start_i = i
-                break
-        if start_i is not None:
-            break
-    if start_i is None:
+    body = "|".join(alts)
+
+    # ^ início de linha
+    # numeração opcional: 2, 02, 2.1, 2.1. etc (forma simples)
+    # separador opcional: - – /
+    pat = (
+        rf"(?im)^\s*"
+        rf"(?:\d{{1,2}}(?:\.\d{{1,2}})*)?\s*"
+        rf"(?:[-–]?\s*)?"
+        rf"(?:{body})\s*"
+        rf"(?:[:\-–/]\s*)?"
+    )
+    return re.compile(pat)
+
+def extract_section_span(text: str, start_words: List[str], end_words: List[str]) -> Optional[str]:
+    """
+    Extrai o texto entre o cabeçalho start e o PRÓXIMO cabeçalho end (por posição no texto).
+    - Objetivo termina quando começa Risco (etc).
+    - Não corta por heurística de linha.
+    - Inclui conteúdo que vier na mesma linha após ":" "-" "–" "/".
+    """
+    t = text or ""
+    start_re = _make_heading_regex(start_words)
+    end_re = _make_heading_regex(end_words)
+
+    m = start_re.search(t)
+    if not m:
         return None
 
-    # localizar próximo end
-    end_i = len(lines)
-    for j in range(start_i + 1, len(lines)):
-        raw = lines[j]
-        n = norms[j]
-        if not _is_heading_candidate(raw):
-            continue
-        for ev in end_variants:
-            if _match_heading(n, ev):
-                end_i = j
-                break
-        if end_i != len(lines):
-            break
+    start_pos = m.end()
+    m2 = end_re.search(t, pos=start_pos)
+    end_pos = m2.start() if m2 else len(t)
 
-    return start_i, end_i
-
-def find_heading_block(text: str, start_variants: List[str], end_variants: List[str]) -> Optional[str]:
-    idx = _find_heading_indices(text, start_variants, end_variants)
-    if not idx:
-        return None
-
-    start_i, end_i = idx
-    lines = (text or "").split("\n")
-
-    first_line = lines[start_i]
-
-    # 👉 pega conteúdo que vem na MESMA linha após :
-    same_line_content = None
-    if ":" in first_line:
-        same_line_content = first_line.split(":", 1)[1].strip()
-
-    # 👉 pega linhas seguintes até próximo cabeçalho
-    following = lines[start_i + 1 : end_i]
-
-    parts = []
-    if same_line_content:
-        parts.append(same_line_content)
-
-    if following:
-        parts.append("\n".join(following))
-
-    block = "\n".join(parts)
-
-    block = re.sub(r"[ \t]+", " ", block)
-    block = re.sub(r"\n{3,}", "\n\n", block)
-
-    block = block.strip(":- \n\t")
-
+    block = t[start_pos:end_pos]
+    block = normalize_text(block).strip(":- \n\t")
     return block or None
 
 def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
     """
-    v3 robusta:
-    - Objetivo / Risco / Escopo / Alcance: cabeçalhos ancorados por linha (com ':' opcional e permitindo 'letras espaçadas').
-    - Cronograma: lê as 3 primeiras datas após 'Cronograma' até o próximo cabeçalho; aceita ano com 2 dígitos.
-
-    CORREÇÃO: evitar que "riscos," do índice seja interpretado como cabeçalho.
+    v4 (por span):
+    - Objetivo termina exatamente no início de Risco
+    - Risco termina no início de Escopo/Alcance/Cronograma
+    - Escopo termina no início de Alcance/Cronograma/Conclusão/etc.
+    - Alcance termina no início de Cronograma/Conclusão/etc.
+    - Cronograma: pega bloco e extrai as 3 datas (corrigindo datas quebradas em linha)
     """
     t = all_text or ""
 
-    objetivo = find_heading_block(
+    objetivo = extract_section_span(
         t,
-        start_variants=["Objetivo"],
-        end_variants=["Risco", "Riscos", "Escopo", "Alcance", "Cronograma"],
+        start_words=["Objetivo"],
+        end_words=["Risco", "Riscos"],
     )
 
-    risco = find_heading_block(
+    risco = extract_section_span(
         t,
-        start_variants=["Risco", "Riscos"],
-        end_variants=["Escopo", "Alcance", "Cronograma"],
+        start_words=["Risco", "Riscos"],
+        end_words=["Escopo", "Alcance", "Cronograma"],
     )
 
-    escopo = find_heading_block(
+    escopo = extract_section_span(
         t,
-        start_variants=["Escopo"],
-        end_variants=[
+        start_words=["Escopo"],
+        end_words=[
             "Alcance",
             "Cronograma",
             "Conclusão", "Conclusao",
@@ -377,10 +305,10 @@ def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
         ],
     )
 
-    alcance = find_heading_block(
+    alcance = extract_section_span(
         t,
-        start_variants=["Alcance"],
-        end_variants=[
+        start_words=["Alcance"],
+        end_words=[
             "Cronograma",
             "Conclusão", "Conclusao",
             "Avaliação", "Avaliacao",
@@ -388,12 +316,12 @@ def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
         ],
     )
 
-    # ---- Cronograma: pegar as 3 primeiras datas no bloco do cronograma
+    # ---- Cronograma: pegar as 3 primeiras datas do bloco
     cronograma = None
-    cr_idx = _find_heading_indices(
+    cr_text = extract_section_span(
         t,
-        start_variants=["Cronograma"],
-        end_variants=[
+        start_words=["Cronograma"],
+        end_words=[
             # comuns nos relatórios Neoenergia
             "0 1 – Auditoria Realizada",
             "0 1 - Auditoria Realizada",
@@ -408,11 +336,16 @@ def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
             "Avaliação", "Avaliacao",
         ],
     )
-    if cr_idx:
-        start_i, end_i = cr_idx
-        lines = (t or "").split("\n")
-        cro_block = "\n".join(lines[start_i + 1 : end_i]) if end_i > start_i + 1 else "\n".join(lines[start_i + 1 :])
-        dates = DATE_RE.findall(cro_block)
+
+    if cr_text:
+        # conserta datas quebradas tipo "23/07/2\n025"
+        cr_fix = re.sub(
+            r"(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d)\s*\n\s*(\d{2,3})",
+            r"\1\2",
+            cr_text,
+        )
+
+        dates = DATE_RE.findall(cr_fix)
 
         def iso_date(s: str) -> Optional[str]:
             s = s.replace(".", "/").replace("-", "/")
@@ -435,7 +368,7 @@ def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
                 "relatorio_final": iso_date(dates[2]),
             }
         else:
-            cronograma = {"raw": re.sub(r"[ \t]+", " ", cro_block).strip()[:600]}
+            cronograma = {"raw": normalize_text(cr_fix)[:600]}
 
     return {
         "objetivo": objetivo,
