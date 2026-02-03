@@ -1,33 +1,29 @@
-def find_heading_block(text: str, start_variants: List[str], end_variants: List[str]) -> Optional[str]:
-    idx = _find_heading_indices(text, start_variants, end_variants)
-    if not idx:
-        return None
+def _match_heading(norm_line: str, variant: str) -> bool:
+    v = _canon_heading(variant)
 
-    start_i, end_i = idx
-    lines = (text or "").split("\n")
+    # match exato (com/sem :)
+    if norm_line == v or norm_line == v + ":":
+        return True
 
-    first_line = lines[start_i]
+    # aceita versão sem espaços (c r o n o g r a m a)
+    if norm_line.replace(" ", "") in {v.replace(" ", ""), v.replace(" ", "") + ":"}:
+        return True
 
-    # 👉 pega conteúdo que vem na MESMA linha após :
-    same_line_content = None
-    if ":" in first_line:
-        same_line_content = first_line.split(":", 1)[1].strip()
+    # ✅ NOVO: aceita quando o título vem com texto na mesma linha:
+    # "Risco / Continuidade...", "Risco: ...", "Risco - ..."
+    if norm_line.startswith(v + " ") or norm_line.startswith(v + ":") or norm_line.startswith(v + "-"):
+        return True
 
-    # 👉 pega linhas seguintes até próximo cabeçalho
-    following = lines[start_i + 1 : end_i]
+    # ✅ NOVO: aceita prefixos numéricos tipo "2 risco", "02 risco", "2. risco"
+    # (canon_heading remove pontuação, então "2. Risco" vira "2 risco")
+    if re.match(rf"^\d+\s+{re.escape(v)}(\s|:|$)", norm_line):
+        return True
 
-    parts = []
-    if same_line_content:
-        parts.append(same_line_content)
-
-    if following:
-        parts.append("\n".join(following))
-
-    block = "\n".join(parts)
-
-    block = re.sub(r"[ \t]+", " ", block)
-    block = re.sub(r"\n{3,}", "\n\n", block)
-
-    block = block.strip(":- \n\t")
-
-    return block or None
+    return False
+    
+    # ✅ NOVO: conserta datas quebradas tipo "23/07/2\n025"
+cro_block = re.sub(
+    r"(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d)\s*\n\s*(\d{2,3})",
+    r"\1\2",
+    cro_block,
+)
