@@ -1,126 +1,56 @@
-def _find_heading_indices(text: str, start_variants: List[str], end_variants: List[str]) -> Optional[Tuple[int, int]]:
-    lines = (text or "").split("\n")
+def _make_heading_regex(words: List[str]) -> re.Pattern:
+    """
+    Cabeçalho como LINHA PURA (do jeito que está no JSON: \nRisco\n).
+    Aceita:
+      - "Risco"
+      - "Risco:"
+      - "2 Risco" / "2. Risco" / "02 – Risco"
+      - letras espaçadas (O B J E T I V O), se aparecer como linha isolada
+    NÃO aceita "Risco / bla bla" ou "Risco: texto..." na mesma linha,
+    porque isso costuma ser fonte de corte indevido no meio do parágrafo.
+    """
+    alts = []
+    for w in words:
+        w_up = _strip_accents_lower(w).upper()
+        alts.append(re.escape(w_up))
+        alts.append(_spaced_letters_pattern(w_up))
 
-    def canon(x: str) -> str:
-        return _canon_heading(x)
+    body = "|".join(alts)
 
-    def is_heading(line: str, variants: List[str]) -> bool:
-        c = canon(line)
-        for v in variants:
-            if c == canon(v):
-                return True
-        return False
+    # LINHA PURA:
+    # ^ [numeração opcional] [texto do heading] [: opcional] $
+    pat = (
+        rf"(?im)^\s*"
+        rf"(?:\d{{1,2}}(?:\.\d{{1,2}})*)?\s*"
+        rf"(?:[-–]?\s*)?"
+        rf"(?:{body})\s*"
+        rf":?\s*$"
+    )
+    return re.compile(pat)
+    
+    def extract_section_span(text: str, start_words: List[str], end_words: List[str]) -> Optional[str]:
+    t = text or ""
+    start_re = _make_heading_regex(start_words)
+    end_re = _make_heading_regex(end_words)
 
-    # achar início (linha pura)
-    start_i = None
-    for i, ln in enumerate(lines):
-        if is_heading(ln, start_variants):
-            start_i = i
-            break
-
-    if start_i is None:
+    m = start_re.search(t)
+    if not m:
         return None
 
-    # achar fim (próximo heading puro)
-    end_i = len(lines)
-    for j in range(start_i + 1, len(lines)):
-        if is_heading(lines[j], end_variants):
-            end_i = j
-            break
+    # começa DEPOIS da linha do cabeçalho
+    start_pos = m.end()
 
-    return start_i, end_i
+    m2 = end_re.search(t, pos=start_pos)
+    end_pos = m2.start() if m2 else len(t)
+
+    block = t[start_pos:end_pos]
+    block = normalize_text(block).strip(":- \n\t")
+    return block or None
     
-    
-    def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
-    t = all_text or ""
-
-    objetivo = find_heading_block(
-        t,
-        start_variants=["Objetivo"],
-        end_variants=["Risco", "Riscos"],
-    )
-
-    risco = find_heading_block(
-        t,
-        start_variants=["Risco", "Riscos"],
-        end_variants=["Escopo", "Alcance", "Cronograma"],
-    )
-
-    escopo = find_heading_block(
-        t,
-        start_variants=["Escopo"],
-        end_variants=[
-            "Alcance",
-            "Cronograma",
-            "Conclusão", "Conclusao",
-            "Avaliação", "Avaliacao",
-            "Classificação", "Classificacao",
-        ],
-    )
-
-    alcance = find_heading_block(
-        t,
-        start_variants=["Alcance"],
-        end_variants=[
-            "Cronograma",
-            "Conclusão", "Conclusao",
-            "Avaliação", "Avaliacao",
-            "Classificação", "Classificacao",
-        ],
-    )
-
-    # ---- Cronograma
-    cronograma = None
-    cr_idx = _find_heading_indices(
-        t,
-        start_variants=["Cronograma"],
-        end_variants=[
-            "Auditoria Realizada",
-            "Contexto",
-            "Conclusão", "Conclusao",
-            "Classificação", "Classificacao",
-            "Constatação", "Constatacao", "CONSTATAÇÕES",
-            "Avaliação", "Avaliacao",
-        ],
-    )
-
-    if cr_idx:
-        start_i, end_i = cr_idx
-        lines = t.split("\n")
-        cro_block = "\n".join(lines[start_i + 1:end_i])
-
-        # conserta datas quebradas
-        cro_block = re.sub(
-            r"(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d)\s*\n\s*(\d{2,3})",
-            r"\1\2",
-            cro_block,
-        )
-
-        dates = DATE_RE.findall(cro_block)
-
-        def iso_date(s: str) -> Optional[str]:
-            s = s.replace(".", "/").replace("-", "/")
-            d, m, y = s.split("/")
-            if len(y) == 2:
-                y = "20" + y
-            try:
-                return datetime(int(y), int(m), int(d)).strftime("%Y-%m-%d")
-            except:
-                return None
-
-        if len(dates) >= 3:
-            cronograma = {
-                "data_inicio_trabalho": iso_date(dates[0]),
-                "draft_emitido": iso_date(dates[1]),
-                "relatorio_final": iso_date(dates[2]),
-            }
-        else:
-            cronograma = {"raw": normalize_text(cro_block)[:600]}
-
-    return {
-        "objetivo": objetivo,
-        "risco_processo": risco,
-        "escopo": escopo,
-        "alcance": alcance,
-        "cronograma": cronograma,
-    }
+    # conserta datas quebradas tipo "23/07/2\n025"
+cr_fix = re.sub(
+    r"(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d)\s*\n\s*(\d{2,3})",
+    r"\1\2",
+    cr_text,
+)
+dates = DATE_RE.findall(cr_fix)
