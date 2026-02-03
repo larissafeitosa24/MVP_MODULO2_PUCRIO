@@ -4,12 +4,12 @@
 # Required job parameters:
 #   --S3_BUCKET           (e.g. meu-bucket)
 #   --RAW_PREFIX          (e.g. audit_reports/raw/)
-#   --PROCESSED_PREFIX      (e.g. audit_reports/PROCESSED/)
+#   --PROCESSED_PREFIX    (e.g. audit_reports/processed/)
 #
 # Optional parameters:
 #   --RUN_MODE            append | overwrite_partitions   (default: append)
 #   --MAX_FILES           int (default: 0 = no limit)
-#   --LOG_PREFIX          (e.g. audit_reports/logs/)  (optional, currently unused)
+#   --LOG_PREFIX          (optional, currently unused)
 #
 # Libraries (Glue Python Shell):
 #   awswrangler, pandas, pyarrow
@@ -17,9 +17,10 @@
 import sys
 import json
 import re
-from dataclasses import asdict, dataclass
+import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import pandas as pd
@@ -32,10 +33,13 @@ from awsglue.utils import getResolvedOptions
 ARG_KEYS = ["S3_BUCKET", "RAW_PREFIX", "PROCESSED_PREFIX"]
 OPTIONAL_KEYS = ["RUN_MODE", "MAX_FILES", "LOG_PREFIX"]
 
-args = getResolvedOptions(sys.argv, ARG_KEYS + [k for k in OPTIONAL_KEYS if f"--{k}" in " ".join(sys.argv)])
+args = getResolvedOptions(
+    sys.argv,
+    ARG_KEYS + [k for k in OPTIONAL_KEYS if f"--{k}" in " ".join(sys.argv)]
+)
 
 S3_BUCKET = args["S3_BUCKET"]
-RAW_PREFIX = args["RAW_PREFIX"].lstrip("/")  # safe
+RAW_PREFIX = args["RAW_PREFIX"].lstrip("/")
 PROCESSED_PREFIX = args["PROCESSED_PREFIX"].lstrip("/")
 
 RUN_MODE = args.get("RUN_MODE", "append").lower()  # append | overwrite_partitions
@@ -46,7 +50,8 @@ s3 = boto3.client("s3")
 # ----------------------------
 # Regex / helpers
 # ----------------------------
-AUD_RE = re.compile(r"\bAUD-\d{5,}\b", re.IGNORECASE)
+AUD_RE_SPACES = re.compile(r"\bAUD\s*-\s*(\d{5,})\b", re.IGNORECASE)
+AUD_RE_CANON = re.compile(r"\bAUD-\d{5,}\b", re.IGNORECASE)
 DATE_RE = re.compile(r"\b(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4})\b")
 WS_RE = re.compile(r"[ \t]+")
 
@@ -71,6 +76,13 @@ def normalize_text(t: str) -> str:
     t = WS_RE.sub(" ", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
+
+def _strip_accents_lower(s: str) -> str:
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFD", s)
+    s2 = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", s2).strip().lower()
 
 def try_parse_date_any(s: str) -> Optional[str]:
     """Return ISO date YYYY-MM-DD from the FIRST date found in string."""
@@ -118,8 +130,12 @@ def extract_pages_or_fallback(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [{"page": None, "text": big}]
 
 def find_aud_code(all_text: str) -> Optional[str]:
-    m = AUD_RE.search(all_text or "")
-    return m.group(0).upper() if m else None
+    # aceita "AUD - 12345" e normaliza pra "AUD-12345"
+    m = AUD_RE_SPACES.search(all_text or "")
+    if m:
+        return f"AUD-{m.group(1)}"
+    m2 = AUD_RE_CANON.search(all_text or "")
+    return m2.group(0).upper() if m2 else None
 
 def pick_cover_text(pages: List[Dict[str, Any]]) -> str:
     if pages:
@@ -127,10 +143,11 @@ def pick_cover_text(pages: List[Dict[str, Any]]) -> str:
     return ""
 
 def extract_title_and_cover_fields(cover_text: str) -> Dict[str, Optional[str]]:
+    # (mantive simples como estava; se quiser, depois plugamos a regra v3 mais robusta)
     lines = [ln.strip() for ln in (cover_text or "").split("\n") if ln.strip()]
     aud_idx = None
     for i, ln in enumerate(lines):
-        if AUD_RE.search(ln):
+        if AUD_RE_SPACES.search(ln) or AUD_RE_CANON.search(ln):
             aud_idx = i
             break
 
@@ -158,7 +175,7 @@ def extract_title_and_cover_fields(cover_text: str) -> Dict[str, Optional[str]]:
         try:
             idx = next(i for i, ln in enumerate(lines) if ln == report_type)
             for ln in lines[idx+1:idx+8]:
-                if AUD_RE.search(ln):
+                if AUD_RE_SPACES.search(ln) or AUD_RE_CANON.search(ln):
                     continue
                 if "RELATÓRIO" in ln.upper() or "RELATORIO" in ln.upper():
                     continue
@@ -170,42 +187,101 @@ def extract_title_and_cover_fields(cover_text: str) -> Dict[str, Optional[str]]:
     emission_date = try_parse_date_any(cover_text)
     return {"title": title, "report_type": report_type, "company": company, "emission_date": emission_date}
 
-def extract_block_between(all_text: str, start_kw: str, end_kws: List[str]) -> Optional[str]:
-    t = all_text or ""
-    si = t.lower().find(start_kw.lower())
-    if si < 0:
-        return None
-    tail = t[si + len(start_kw):]
-    cut = len(tail)
-    for ek in end_kws:
-        ei = tail.lower().find(ek.lower())
-        if 0 <= ei < cut:
-            cut = ei
-    out = normalize_text(tail[:cut]).strip(":- \n\t")
+# ----------------------------
+# Loop-based section extraction (robusta)
+# ----------------------------
+def extract_by_loop(text: str, start_titles: List[str], end_titles: List[str]) -> Optional[str]:
+    """
+    Lê linha-a-linha.
+    Começa quando encontra um título (ex: Objetivo).
+    Para quando encontra o próximo título (ex: Risco).
+    """
+    lines = (text or "").split("\n")
+
+    def canon(line: str) -> str:
+        c = _strip_accents_lower(line or "").strip()
+        # remove numeração tipo "2", "2.1", "02 –"
+        c = re.sub(r"^\d{1,2}(?:\.\d{1,2})*\s*[-–]?\s*", "", c)
+        return c
+
+    start_set = { _strip_accents_lower(x).strip() for x in start_titles }
+    end_set = { _strip_accents_lower(x).strip() for x in end_titles }
+
+    collecting = False
+    buf: List[str] = []
+
+    for line in lines:
+        c = canon(line)
+
+        if c in start_set:
+            collecting = True
+            continue
+
+        if collecting and c in end_set:
+            break
+
+        if collecting:
+            buf.append(line)
+
+    out = normalize_text("\n".join(buf)).strip(":- \n\t")
     return out or None
 
 def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
-    objetivo = extract_block_between(all_text, "Objetivo", ["Risco", "Escopo", "Alcance", "Cronograma"])
-    risco = extract_block_between(all_text, "Risco", ["Escopo", "Alcance", "Cronograma"])
-    escopo = extract_block_between(all_text, "Escopo", ["Alcance", "Cronograma", "Conclusão", "Avaliação", "Classificação"])
-    alcance = extract_block_between(all_text, "Alcance", ["Cronograma", "Conclusão", "Avaliação", "Classificação"])
+    t = all_text or ""
 
-    cronograma_txt = extract_block_between(
-        all_text,
-        "Cronograma",
-        ["Contexto", "Avaliação", "Classificação", "Constatação", "CONSTATAÇÕES", "04", "03", "02", "01"],
+    objetivo = extract_by_loop(t, ["Objetivo"], ["Risco", "Riscos"])
+    risco = extract_by_loop(t, ["Risco", "Riscos"], ["Escopo", "Alcance", "Cronograma"])
+
+    escopo = extract_by_loop(
+        t,
+        ["Escopo"],
+        ["Alcance", "Cronograma", "Conclusão", "Conclusao", "Avaliação", "Avaliacao", "Classificação", "Classificacao"],
     )
+
+    alcance = extract_by_loop(
+        t,
+        ["Alcance"],
+        ["Cronograma", "Conclusão", "Conclusao", "Avaliação", "Avaliacao", "Classificação", "Classificacao"],
+    )
+
+    cronograma_txt = extract_by_loop(
+        t,
+        ["Cronograma"],
+        ["Contexto", "Avaliação", "Avaliacao", "Classificação", "Classificacao", "Constatação", "Constatacao", "CONSTATAÇÕES"],
+    )
+
     schedule = None
     if cronograma_txt:
-        dates = DATE_RE.findall(cronograma_txt)
+        # conserta datas quebradas tipo "23/07/2\n025"
+        cron_fix = re.sub(
+            r"(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d)\s*\n\s*(\d{2,3})",
+            r"\1\2",
+            cronograma_txt,
+        )
+
+        dates = DATE_RE.findall(cron_fix)
+
+        def iso_date_from_raw(raw_date: str) -> Optional[str]:
+            raw = (raw_date or "").replace(".", "/").replace("-", "/")
+            parts = raw.split("/")
+            if len(parts) != 3:
+                return None
+            d, mo, y = parts
+            if len(y) == 2:
+                y = "20" + y
+            try:
+                return datetime(int(y), int(mo), int(d)).strftime("%Y-%m-%d")
+            except Exception:
+                return None
+
         if len(dates) >= 3:
             schedule = {
-                "data_inicio_trabalho": try_parse_date_any(dates[0]),
-                "draft_emitido": try_parse_date_any(dates[1]),
-                "relatorio_final": try_parse_date_any(dates[2]),
+                "data_inicio_trabalho": iso_date_from_raw(dates[0]),
+                "draft_emitido": iso_date_from_raw(dates[1]),
+                "relatorio_final": iso_date_from_raw(dates[2]),
             }
         else:
-            schedule = {"raw": cronograma_txt}
+            schedule = {"raw": normalize_text(cron_fix)[:600]}
 
     return {
         "objetivo": objetivo,
@@ -226,11 +302,6 @@ def extract_classification(all_text: str) -> Optional[str]:
     return None
 
 def extract_recommendations(all_text: str) -> List[Dict[str, Any]]:
-    """
-    Extract repeated blocks with:
-      Recomendação / Responsável / Prazo
-    Works even if content is long (DOTALL).
-    """
     recs = []
     pattern = re.compile(
         r"Recomendação\s*[\n ]+Responsável\s*[\n ]+Prazo\s*[\n ]+(.*?)(?=\n\s*Recomendação\s*[\n ]+Responsável\s*[\n ]+Prazo|\Z)",
@@ -248,25 +319,11 @@ def extract_recommendations(all_text: str) -> List[Dict[str, Any]]:
                 if i - 1 >= 0:
                     resp = lines[i - 1]
                 break
-        recs.append(
-            {
-                "recomendacao": block,
-                "responsavel": resp,
-                "prazo": prazo,
-                "raw_block": block,
-            }
-        )
+        recs.append({"recomendacao": block, "responsavel": resp, "prazo": prazo, "raw_block": block})
     return recs
 
 def extract_findings_minimal(all_text: str) -> List[Dict[str, Any]]:
-    """
-    Minimal v1 findings extractor:
-    - Tries to split by numbered findings like "1.1", "2.3" if present near constatações.
-    - Captures a risk label if one of RISK_OPTIONS appears in the block.
-    - Does NOT guarantee perfect mapping; designed to evolve.
-    """
     t = all_text or ""
-    # Try to isolate the findings section roughly
     sec = None
     for kw in ["CONSTATAÇÕES E RECOMENDAÇÕES", "CONSTATAÇÕES", "CONSTATAÇÃO", "NAO CONFORMIDADES", "NÃO CONFORMIDADES"]:
         idx = t.upper().find(kw)
@@ -276,16 +333,14 @@ def extract_findings_minimal(all_text: str) -> List[Dict[str, Any]]:
     if not sec:
         return []
 
-    # Split by finding ids like 1.1 / 1.2 / 2.1 ...
     parts = re.split(r"\n\s*(\d+\.\d+)\s*\n", normalize_text(sec))
     if len(parts) < 3:
-        # fallback: single block
         block = normalize_text(sec)
         risk = None
         up = block.upper()
         for ro in RISK_OPTIONS:
             if ro in up:
-                risk = ro.title().replace("Médio", "Médio").replace("Critico", "Crítico")
+                risk = ro.title().replace("Medio", "Médio").replace("Critico", "Crítico")
                 break
         return [{
             "finding_id": "F001",
@@ -297,8 +352,6 @@ def extract_findings_minimal(all_text: str) -> List[Dict[str, Any]]:
         }]
 
     findings = []
-    # parts = [pre, id1, text1, id2, text2, ...]
-    pre = parts[0]
     for i in range(1, len(parts) - 1, 2):
         fid = parts[i]
         block = normalize_text(parts[i + 1])
@@ -319,11 +372,45 @@ def extract_findings_minimal(all_text: str) -> List[Dict[str, Any]]:
     return findings
 
 # ----------------------------
+# Partition helpers
+# ----------------------------
+def derive_partitions_from_path(key: str) -> Optional[Dict[str, str]]:
+    """
+    Se o raw vier particionado, ex:
+      .../year=2025/month=12/file.json
+      .../ano=2025/mes=12/file.json
+    usa isso como partição do output.
+    """
+    k = key.lower()
+
+    m = re.search(r"(?:^|/)year=(\d{4})(?:/|$)", k)
+    n = re.search(r"(?:^|/)month=(\d{1,2})(?:/|$)", k)
+    if m and n:
+        return {"ano": f"{int(m.group(1)):04d}", "mes": f"{int(n.group(1)):02d}"}
+
+    m2 = re.search(r"(?:^|/)ano=(\d{4})(?:/|$)", k)
+    n2 = re.search(r"(?:^|/)mes=(\d{1,2})(?:/|$)", k)
+    if m2 and n2:
+        return {"ano": f"{int(m2.group(1)):04d}", "mes": f"{int(n2.group(1)):02d}"}
+
+    return None
+
+def derive_partitions_from_emission(emission_date_iso: Optional[str]) -> Dict[str, str]:
+    if emission_date_iso:
+        try:
+            dt = datetime.fromisoformat(emission_date_iso)
+            return {"ano": f"{dt.year:04d}", "mes": f"{dt.month:02d}"}
+        except Exception:
+            pass
+    return {"ano": "unknown", "mes": "unknown"}
+
+# ----------------------------
 # Output rows
 # ----------------------------
 @dataclass
 class ParsedReport:
     source_s3_uri: str
+    source_key: str
     aud_code: Optional[str]
     title: Optional[str]
     report_type: Optional[str]
@@ -338,11 +425,12 @@ class ParsedReport:
     recommendations: List[Dict[str, Any]]
     findings: List[Dict[str, Any]]
 
-def parse_report(source_s3_uri: str, doc: Dict[str, Any]) -> ParsedReport:
+def parse_report(source_s3_uri: str, source_key: str, doc: Dict[str, Any]) -> ParsedReport:
     pages = extract_pages_or_fallback(doc)
     all_text = normalize_text("\n\n".join(p.get("text", "") for p in pages if p.get("text")))
 
     aud_code = find_aud_code(all_text)
+
     cover = pick_cover_text(pages)
     cover_fields = extract_title_and_cover_fields(cover)
 
@@ -354,6 +442,7 @@ def parse_report(source_s3_uri: str, doc: Dict[str, Any]) -> ParsedReport:
 
     return ParsedReport(
         source_s3_uri=source_s3_uri,
+        source_key=source_key,
         aud_code=aud_code,
         title=cover_fields["title"],
         report_type=cover_fields["report_type"],
@@ -391,18 +480,15 @@ def s3_read_json(bucket: str, key: str) -> Dict[str, Any]:
 # ----------------------------
 # Parquet writing
 # ----------------------------
-def derive_partitions(emission_date_iso: Optional[str]) -> Dict[str, str]:
-    if emission_date_iso:
-        try:
-            dt = datetime.fromisoformat(emission_date_iso)
-            return {"ano": f"{dt.year:04d}", "mes": f"{dt.month:02d}"}
-        except Exception:
-            pass
-    return {"ano": "unknown", "mes": "unknown"}
-
 def write_parquet_outputs(parsed: ParsedReport) -> None:
-    part = derive_partitions(parsed.emission_date)
+    # Prioriza partição do PATH do raw; fallback para emission_date
+    part = derive_partitions_from_path(parsed.source_key) or derive_partitions_from_emission(parsed.emission_date)
     ingestion_ts = datetime.now(timezone.utc).isoformat()
+
+    base_out = f"s3://{S3_BUCKET}/{PROCESSED_PREFIX.rstrip('/')}"
+    head_path = f"{base_out}/head/"
+    rec_path = f"{base_out}/recommendations/"
+    fin_path = f"{base_out}/findings/"
 
     # ---- HEAD (1 row)
     head_row = {
@@ -424,9 +510,6 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
         **part,
     }
     df_head = pd.DataFrame([head_row])
-
-    # overwrite_partitions works best with partition_cols; append is simplest
-    head_path = f"s3://{S3_BUCKET}/{PROCESSED_PREFIX.rstrip('/')}/head/"
     wr.s3.to_parquet(
         df=df_head,
         path=head_path,
@@ -441,7 +524,7 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
         rec_rows.append({
             "aud_code": parsed.aud_code,
             "recommendation_id": f"R{idx:03d}",
-            "finding_id": None,  # preencheremos quando o parser amarrar
+            "finding_id": None,
             "recomendacao": r.get("recomendacao"),
             "responsavel": r.get("responsavel"),
             "prazo": r.get("prazo"),
@@ -452,7 +535,6 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
         })
     if rec_rows:
         df_rec = pd.DataFrame(rec_rows)
-        rec_path = f"s3://{S3_BUCKET}/{PROCESSED_PREFIX.rstrip('/')}/recommendations/"
         wr.s3.to_parquet(
             df=df_rec,
             path=rec_path,
@@ -478,7 +560,6 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
         })
     if fin_rows:
         df_fin = pd.DataFrame(fin_rows)
-        fin_path = f"s3://{S3_BUCKET}/{PROCESSED_PREFIX.rstrip('/')}/findings/"
         wr.s3.to_parquet(
             df=df_fin,
             path=fin_path,
@@ -503,16 +584,14 @@ def main():
         source_uri = f"s3://{S3_BUCKET}/{key}"
         try:
             doc = s3_read_json(S3_BUCKET, key)
-            parsed = parse_report(source_uri, doc)
+            parsed = parse_report(source_uri, key, doc)
 
-            # Write Parquet outputs
             write_parquet_outputs(parsed)
 
             processed += 1
             if processed % 25 == 0:
                 print(f"[INFO] processed={processed}")
         except Exception as e:
-            # Keep going; log error
             print(f"[ERROR] failed file: {source_uri} | err={repr(e)}")
 
     print(f"[DONE] processed={processed} | total_found={len(keys)}")
