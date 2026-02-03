@@ -68,10 +68,17 @@ CLASS_OPTIONS = {
 
 RISK_OPTIONS = ["BAIXO", "MÉDIO", "MEDIO", "ALTO", "CRÍTICO", "CRITICO", "OPORTUNIDADE DE MELHORIA"]
 
+REPORT_TYPE_CANON = {
+    "relatorio final": "Relatório Final",
+    "relatorio preliminar": "Relatório Preliminar",
+    "relatorio de acompanhamento": "Relatório de Acompanhamento",
+    "relatorio de follow-up": "Relatório de Follow-up",
+}
+
 def normalize_text(t: str) -> str:
     if not t:
         return ""
-    t = t.replace("\u00ad", "")
+    t = t.replace("\u00ad", "")  # soft hyphen
     t = t.replace("\r", "\n")
     t = WS_RE.sub(" ", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
@@ -106,8 +113,7 @@ def deep_collect_strings(obj: Any, out: List[str]) -> None:
     if obj is None:
         return
     if isinstance(obj, str):
-        out.append(obj)
-        return
+        out.append(obj); return
     if isinstance(obj, list):
         for it in obj:
             deep_collect_strings(it, out)
@@ -120,10 +126,7 @@ def deep_collect_strings(obj: Any, out: List[str]) -> None:
 def extract_pages_or_fallback(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     pages = doc.get("pages")
     if isinstance(pages, list) and pages and isinstance(pages[0], dict) and ("text" in pages[0]):
-        out = []
-        for p in pages:
-            out.append({"page": p.get("page"), "text": normalize_text(p.get("text", ""))})
-        return out
+        return [{"page": p.get("page"), "text": normalize_text(p.get("text", ""))} for p in pages]
     strings: List[str] = []
     deep_collect_strings(doc, strings)
     big = normalize_text("\n".join(strings))
@@ -139,69 +142,127 @@ def find_aud_code(all_text: str) -> Optional[str]:
 
 def pick_cover_text(pages: List[Dict[str, Any]]) -> str:
     if pages:
-        return (pages[0].get("text") or "")[:5000]
+        return (pages[0].get("text") or "")[:8000]
     return ""
 
+# ----------------------------
+# CAPA - Regra v3 (RESTAURADA)
+# ----------------------------
 def extract_title_and_cover_fields(cover_text: str) -> Dict[str, Optional[str]]:
-    # (mantive simples como estava; se quiser, depois plugamos a regra v3 mais robusta)
-    lines = [ln.strip() for ln in (cover_text or "").split("\n") if ln.strip()]
-    aud_idx = None
-    for i, ln in enumerate(lines):
-        if AUD_RE_SPACES.search(ln) or AUD_RE_CANON.search(ln):
-            aud_idx = i
+    raw_lines = [ln.strip() for ln in (cover_text or "").split("\n") if ln.strip()]
+    norms = [_strip_accents_lower(x) for x in raw_lines]
+
+    # Remove números de página
+    filtered: List[Tuple[str, str]] = []
+    for r, n in zip(raw_lines, norms):
+        if re.fullmatch(r"\d+", n):
+            continue
+        filtered.append((r, n))
+
+    # identifica linha(s) de confidencialidade (inclui variações)
+    def is_conf_line(n: str) -> bool:
+        # cobre: "Este relatório é estritamente confidencial..." e variações
+        if "este relatorio" in n and ("confidencial" in n or "uso exclusivo" in n or "exclusiv" in n):
+            return True
+        if "estritamente confidencial" in n:
+            return True
+        if "uso exclusivo" in n:
+            return True
+        return False
+
+    # Remove cabeçalhos frequentes e qualquer linha confidencial do universo analisado
+    skip_set = {"auditoria interna", "confidential"}
+    filtered2 = [(r, n) for r, n in filtered if n not in skip_set and not is_conf_line(n)]
+
+    # Identificar Tipo de Relatório (primeira ocorrência canônica)
+    report_type = None
+    rt_idx = None
+    for j, (r, n) in enumerate(filtered2):
+        canon = REPORT_TYPE_CANON.get(n)
+        if canon:
+            report_type = canon
+            rt_idx = j
             break
+
+    def looks_like_aud(r: str) -> bool:
+        return bool(AUD_RE_SPACES.search(r) or AUD_RE_CANON.search(r))
+
+    def looks_like_date(n: str) -> bool:
+        return bool(DATE_RE.search(n))
 
     title = None
-    if aud_idx is not None:
-        candidates = []
-        for ln in lines[max(0, aud_idx - 6):aud_idx]:
-            up = ln.upper()
-            if "AUDITORIA" in up and "INTERNA" in up:
-                continue
-            if up in {"AUDITORIA", "INTERNA"}:
-                continue
-            candidates.append(ln)
-        if candidates:
-            title = max(candidates, key=len)
-
-    report_type = None
-    for ln in lines:
-        if "RELATÓRIO" in ln.upper() or "RELATORIO" in ln.upper():
-            report_type = ln.strip()
-            break
-
     company = None
-    if report_type:
-        try:
-            idx = next(i for i, ln in enumerate(lines) if ln == report_type)
-            for ln in lines[idx+1:idx+8]:
-                if AUD_RE_SPACES.search(ln) or AUD_RE_CANON.search(ln):
-                    continue
-                if "RELATÓRIO" in ln.upper() or "RELATORIO" in ln.upper():
-                    continue
-                company = ln
+
+    if rt_idx is not None:
+        # Título = todas as linhas ANTES do tipo, ignorando data/AUD e confidencialidade
+        title_lines: List[str] = []
+        for r, n in filtered2[:rt_idx]:
+            if looks_like_aud(r) or looks_like_date(n):
+                continue
+            # evita pegar "Grupo Neoenergia" ou ruídos comuns (opcional)
+            title_lines.append(r)
+
+        # Unir preservando continuação com '–' ou '-'
+        merged: List[str] = []
+        for ln in title_lines:
+            if merged and merged[-1].rstrip().endswith(("–", "-")):
+                prev = merged[-1].rstrip(" –-").rstrip()
+                curr = ln.lstrip(" –-").lstrip()
+                merged[-1] = f"{prev} – {curr}"
+            else:
+                merged.append(ln)
+        title = " ".join(merged) if merged else None
+
+        # Empresa = primeira linha após o tipo, até AUD
+        for r, n in filtered2[rt_idx + 1:]:
+            if looks_like_aud(r):
                 break
-        except StopIteration:
-            pass
+            if n:
+                company = r
+                break
+    else:
+        # Sem tipo detectado -> default 'Relatório Final'
+        report_type = "Relatório Final"
+
+        # título: linhas após última confidencialidade (na lista original) até achar AUD/tipo/date/ruído
+        last_conf = -1
+        for i, (r, n) in enumerate(filtered):
+            if is_conf_line(n):
+                last_conf = i
+        after = filtered[last_conf + 1:]
+
+        title_lines: List[str] = []
+        for r, n in after:
+            if REPORT_TYPE_CANON.get(n):
+                break
+            if looks_like_aud(r) or looks_like_date(n):
+                continue
+            if n in skip_set or is_conf_line(n):
+                continue
+            title_lines.append(r)
+
+        merged: List[str] = []
+        for ln in title_lines:
+            if merged and merged[-1].rstrip().endswith(("–", "-")):
+                prev = merged[-1].rstrip(" –-").rstrip()
+                curr = ln.lstrip(" –-").lstrip()
+                merged[-1] = f"{prev} – {curr}"
+            else:
+                merged.append(ln)
+        title = " ".join(merged) if merged else None
 
     emission_date = try_parse_date_any(cover_text)
     return {"title": title, "report_type": report_type, "company": company, "emission_date": emission_date}
 
 # ----------------------------
-# Loop-based section extraction (robusta)
+# Loop-based section extraction (pra não cortar)
 # ----------------------------
 def extract_by_loop(text: str, start_titles: List[str], end_titles: List[str]) -> Optional[str]:
-    """
-    Lê linha-a-linha.
-    Começa quando encontra um título (ex: Objetivo).
-    Para quando encontra o próximo título (ex: Risco).
-    """
     lines = (text or "").split("\n")
 
     def canon(line: str) -> str:
         c = _strip_accents_lower(line or "").strip()
-        # remove numeração tipo "2", "2.1", "02 –"
-        c = re.sub(r"^\d{1,2}(?:\.\d{1,2})*\s*[-–]?\s*", "", c)
+        c = re.sub(r"^\d{1,2}(?:\.\d{1,2})*\s*[-–]?\s*", "", c)  # remove numeração tipo 2.1
         return c
 
     start_set = { _strip_accents_lower(x).strip() for x in start_titles }
@@ -233,26 +294,22 @@ def extract_obj_risk_scope_reach_schedule(all_text: str) -> Dict[str, Any]:
     risco = extract_by_loop(t, ["Risco", "Riscos"], ["Escopo", "Alcance", "Cronograma"])
 
     escopo = extract_by_loop(
-        t,
-        ["Escopo"],
+        t, ["Escopo"],
         ["Alcance", "Cronograma", "Conclusão", "Conclusao", "Avaliação", "Avaliacao", "Classificação", "Classificacao"],
     )
 
     alcance = extract_by_loop(
-        t,
-        ["Alcance"],
+        t, ["Alcance"],
         ["Cronograma", "Conclusão", "Conclusao", "Avaliação", "Avaliacao", "Classificação", "Classificacao"],
     )
 
     cronograma_txt = extract_by_loop(
-        t,
-        ["Cronograma"],
+        t, ["Cronograma"],
         ["Contexto", "Avaliação", "Avaliacao", "Classificação", "Classificacao", "Constatação", "Constatacao", "CONSTATAÇÕES"],
     )
 
     schedule = None
     if cronograma_txt:
-        # conserta datas quebradas tipo "23/07/2\n025"
         cron_fix = re.sub(
             r"(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d)\s*\n\s*(\d{2,3})",
             r"\1\2",
@@ -375,14 +432,7 @@ def extract_findings_minimal(all_text: str) -> List[Dict[str, Any]]:
 # Partition helpers
 # ----------------------------
 def derive_partitions_from_path(key: str) -> Optional[Dict[str, str]]:
-    """
-    Se o raw vier particionado, ex:
-      .../year=2025/month=12/file.json
-      .../ano=2025/mes=12/file.json
-    usa isso como partição do output.
-    """
     k = key.lower()
-
     m = re.search(r"(?:^|/)year=(\d{4})(?:/|$)", k)
     n = re.search(r"(?:^|/)month=(\d{1,2})(?:/|$)", k)
     if m and n:
@@ -415,7 +465,7 @@ class ParsedReport:
     title: Optional[str]
     report_type: Optional[str]
     company: Optional[str]
-    emission_date: Optional[str]  # ISO
+    emission_date: Optional[str]
     classification: Optional[str]
     objetivo: Optional[str]
     risco_processo: Optional[str]
@@ -481,7 +531,7 @@ def s3_read_json(bucket: str, key: str) -> Dict[str, Any]:
 # Parquet writing
 # ----------------------------
 def write_parquet_outputs(parsed: ParsedReport) -> None:
-    # Prioriza partição do PATH do raw; fallback para emission_date
+    # Prioriza partição do PATH do raw; fallback emission_date
     part = derive_partitions_from_path(parsed.source_key) or derive_partitions_from_emission(parsed.emission_date)
     ingestion_ts = datetime.now(timezone.utc).isoformat()
 
@@ -490,7 +540,6 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
     rec_path = f"{base_out}/recommendations/"
     fin_path = f"{base_out}/findings/"
 
-    # ---- HEAD (1 row)
     head_row = {
         "aud_code": parsed.aud_code,
         "title": parsed.title,
@@ -510,15 +559,8 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
         **part,
     }
     df_head = pd.DataFrame([head_row])
-    wr.s3.to_parquet(
-        df=df_head,
-        path=head_path,
-        dataset=True,
-        mode=RUN_MODE,
-        partition_cols=["ano", "mes"],
-    )
+    wr.s3.to_parquet(df=df_head, path=head_path, dataset=True, mode=RUN_MODE, partition_cols=["ano", "mes"])
 
-    # ---- RECOMMENDATIONS (N rows)
     rec_rows = []
     for idx, r in enumerate(parsed.recommendations or [], start=1):
         rec_rows.append({
@@ -535,15 +577,8 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
         })
     if rec_rows:
         df_rec = pd.DataFrame(rec_rows)
-        wr.s3.to_parquet(
-            df=df_rec,
-            path=rec_path,
-            dataset=True,
-            mode=RUN_MODE,
-            partition_cols=["ano", "mes"],
-        )
+        wr.s3.to_parquet(df=df_rec, path=rec_path, dataset=True, mode=RUN_MODE, partition_cols=["ano", "mes"])
 
-    # ---- FINDINGS (N rows)
     fin_rows = []
     for f in (parsed.findings or []):
         fin_rows.append({
@@ -560,13 +595,7 @@ def write_parquet_outputs(parsed: ParsedReport) -> None:
         })
     if fin_rows:
         df_fin = pd.DataFrame(fin_rows)
-        wr.s3.to_parquet(
-            df=df_fin,
-            path=fin_path,
-            dataset=True,
-            mode=RUN_MODE,
-            partition_cols=["ano", "mes"],
-        )
+        wr.s3.to_parquet(df=df_fin, path=fin_path, dataset=True, mode=RUN_MODE, partition_cols=["ano", "mes"])
 
 # ----------------------------
 # Main
@@ -585,7 +614,6 @@ def main():
         try:
             doc = s3_read_json(S3_BUCKET, key)
             parsed = parse_report(source_uri, key, doc)
-
             write_parquet_outputs(parsed)
 
             processed += 1
