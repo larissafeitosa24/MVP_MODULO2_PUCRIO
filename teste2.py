@@ -1,29 +1,23 @@
-def _match_heading(norm_line: str, variant: str) -> bool:
-    v = _canon_heading(variant)
+def _is_heading_candidate(raw_line: str) -> bool:
+    s = (raw_line or "").strip()
+    if not s:
+        return False
 
-    # match exato (com/sem :)
-    if norm_line == v or norm_line == v + ":":
-        return True
+    # se termina como frase, provavelmente não é cabeçalho
+    if s.endswith((",", ";", ".", ")", "…")):
+        return False
 
-    # aceita versão sem espaços (c r o n o g r a m a)
-    if norm_line.replace(" ", "") in {v.replace(" ", ""), v.replace(" ", "") + ":"}:
-        return True
+    # precisa começar com maiúscula ou estar em caixa alta
+    if not (s[0].isupper() or s.isupper()):
+        return False
 
-    # ✅ NOVO: aceita quando o título vem com texto na mesma linha:
-    # "Risco / Continuidade...", "Risco: ...", "Risco - ..."
-    if norm_line.startswith(v + " ") or norm_line.startswith(v + ":") or norm_line.startswith(v + "-"):
-        return True
+    # ✅ NOVO: cabeçalho "puro" costuma ser curto (evita cortar quando aparece "Escopo ..." no meio)
+    # (ex.: "Escopo" / "Alcance" / "Cronograma" / "Risco", etc.)
+    if len(s) > 28:
+        return False
 
-    # ✅ NOVO: aceita prefixos numéricos tipo "2 risco", "02 risco", "2. risco"
-    # (canon_heading remove pontuação, então "2. Risco" vira "2 risco")
-    if re.match(rf"^\d+\s+{re.escape(v)}(\s|:|$)", norm_line):
-        return True
+    # ✅ NOVO: se tiver muitos tokens, é frase/parágrafo, não cabeçalho
+    if len(s.split()) > 4:
+        return False
 
-    return False
-    
-    # ✅ NOVO: conserta datas quebradas tipo "23/07/2\n025"
-cro_block = re.sub(
-    r"(\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d)\s*\n\s*(\d{2,3})",
-    r"\1\2",
-    cro_block,
-)
+    return True
